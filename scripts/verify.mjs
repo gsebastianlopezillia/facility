@@ -7,6 +7,9 @@ import {
   recreateTestDatabase,
 } from "./verify-test-databases.mjs";
 
+const isWindows = process.platform === "win32";
+const pnpm = isWindows ? "pnpm.cmd" : "pnpm";
+
 const wasRunning = output("docker", [
   ...DEV_COMPOSE,
   "ps",
@@ -16,8 +19,6 @@ const wasRunning = output("docker", [
   "postgres",
 ]).trim();
 let startedPostgres = false;
-const isWindows = process.platform === "win32";
-const pnpm = isWindows ? "pnpm.cmd" : "pnpm";
 
 try {
   step("Lint", pnpm, ["lint"]);
@@ -40,7 +41,7 @@ try {
     recreateTestDatabase(database, run);
   }
 
-  step("Critical integration tests (direct, uncached, skips forbidden)", "pnpm", ["test:critical"]);
+  step("Critical integration tests (direct, uncached, skips forbidden)", pnpm, ["test:critical"]);
   step("Remaining tests (Turbo cache disabled)", pnpm, ["test:uncached"]);
   step("Removed component references", pnpm, ["check:unused"]);
   step("Repository guards", pnpm, ["guards"]);

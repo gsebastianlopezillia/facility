@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +21,7 @@ const imagesWorkflow = readFileSync(
   "utf8",
 );
 const ciWorkflow = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+const runnerDockerfile = readFileSync(new URL("../runner/Dockerfile", import.meta.url), "utf8");
 
 test("manual publication is SHA-only even when dispatch targets a tag", () => {
   for (const ref of ["refs/heads/main", "refs/heads/feature", "refs/tags/v0.3.0"]) {
@@ -231,4 +233,102 @@ test("workspace CI runs the persistent Docker acceptance path", () => {
   assert.match(workspaceJob, /FACILITY_WORKSPACE_TEST_IMAGE: facility-runner:dev/);
   assert.match(workspaceJob, /run: pnpm test:e2e-workspace/);
   assert.doesNotMatch(workspaceJob, /CodeBuild|run-objective|sandbox\.e2e/);
+});
+
+test("runner Go binaries resolve the fixed cryptography and gRPC modules", () => {
+  assert.doesNotMatch(runnerDockerfile, /google\.golang\.org\/grpc@v1\.83\.1/);
+  assert.doesNotMatch(runnerDockerfile, /golang\.org\/x\/crypto@v0\.55\.0/);
+  assert.match(
+    runnerDockerfile,
+    /for binary in \/out\/dockerd \/out\/containerd \/out\/rootlesskit \/out\/docker-buildx \/out\/docker-compose \/out\/gh; do[\s\S]*golang\.org\/x\/crypto" && \$3 == "v0\.56\.0"/,
+  );
+  assert.match(
+    runnerDockerfile,
+    /for binary in \/out\/dockerd \/out\/containerd \/out\/containerd-shim-runc-v2 \/out\/ctr \/out\/docker-buildx \/out\/docker-compose \/out\/gh; do[\s\S]*google\.golang\.org\/grpc" && \$3 == "v1\.83\.2"/,
+  );
+});
+
+test("every gRPC-bearing source build replaces the vulnerable module", () => {
+  assert.doesNotMatch(runnerDockerfile, /google\.golang\.org\/grpc[^\n]*v1\.83\.1/);
+  for (const stage of [
+    "moby-build",
+    "containerd-build",
+    "buildx-build",
+    "compose-build",
+    "gh-build",
+  ]) {
+    const sourceBuild = runnerDockerfile.split(` AS ${stage}\n`)[1]?.split("\nFROM ")[0];
+    assert.ok(sourceBuild, `missing source build ${stage}`);
+    assert.match(
+      sourceBuild,
+      /go mod edit -replace=google\.golang\.org\/grpc=google\.golang\.org\/grpc@v1\.83\.2\s/,
+      `${stage} must rebuild against the fixed gRPC module`,
+    );
+  }
+});
+
+test("the executable gRPC audit accepts fixed modules and rejects unsafe binaries", () => {
+  // Execute the Dockerfile's actual shell loop with deterministic go-version output.
+  // This checks the gate itself without requiring registries or a Go toolchain.
+  const audit = [...runnerDockerfile.matchAll(/for binary in ([^;]+); do[\s\S]*?\n {2}done/g)].find(
+    ([loop]) => loop.includes('"google.golang.org/grpc"'),
+  );
+  assert.ok(audit, "missing executable gRPC audit");
+  const binaries = audit[1].split(" ");
+  assert.equal(binaries.length, 7);
+  const command = `
+    go() {
+      if [ "$3" = "$AUDIT_TEST_BINARY" ]; then
+        case "$AUDIT_TEST_FAILURE" in
+          outdated) printf '=> google.golang.org/grpc v1.83.1\\n'; return ;;
+          missing) printf 'dep example.com/unrelated v1.0.0\\n'; return ;;
+          error) return 1 ;;
+        esac
+      fi
+      printf '=> google.golang.org/grpc v1.83.2\\n'
+    }
+    ${audit[0].replaceAll(/\\\n/g, " ")}
+  `;
+  const runAudit = (binary = "", failure = "") =>
+    spawnSync("sh", ["-c", command], {
+      encoding: "utf8",
+      env: { ...process.env, AUDIT_TEST_BINARY: binary, AUDIT_TEST_FAILURE: failure },
+    });
+  const accepted = runAudit();
+  assert.equal(accepted.status, 0, accepted.stderr);
+  for (const binary of binaries) {
+    for (const failure of ["outdated", "missing", "error"]) {
+      const rejected = runAudit(binary, failure);
+      assert.equal(
+        rejected.status,
+        1,
+        `${binary}: ${failure} must fail closed: ${rejected.stderr}`,
+      );
+    }
+  }
+});
+
+test("Vercel runner supports SDK user switching without granting node sudo privileges", () => {
+  const vercelStage = runnerDockerfile
+    .split("FROM runner-base AS vercel-runner")[1]
+    ?.split("FROM runner-base AS runner")[0];
+  assert.ok(vercelStage);
+  assert.match(vercelStage, /apt-get install -y --no-install-recommends sudo/);
+  assert.match(vercelStage, /sudo -n -u node -- sh -c/);
+  assert.match(vercelStage, /test -u \/usr\/bin\/sudo/);
+  assert.match(vercelStage, /runuser -u node -- sh -c/);
+  assert.match(vercelStage, /! runuser -u node -- sudo -n -u root -- true/);
+  assert.doesNotMatch(vercelStage, /NOPASSWD/);
+  assert.match(ciWorkflow, /docker build --target vercel-runner -f runner\/Dockerfile \./);
+});
+
+test("runner rejects Chromium packages older than the reviewed security fix", () => {
+  assert.match(runnerDockerfile, /ARG CHROMIUM_MIN_VERSION=153\.0\.8010\.52-1~deb13u1/);
+  for (const name of ["chromium", "chromium-common"]) {
+    assert.ok(
+      runnerDockerfile.includes(
+        `dpkg --compare-versions "$(dpkg-query -W -f='\${Version}' ${name})" ge "$CHROMIUM_MIN_VERSION"`,
+      ),
+    );
+  }
 });

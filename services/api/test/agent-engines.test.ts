@@ -9,6 +9,8 @@ import {
   ClaudeEventParser,
   CodexEngine,
   CodexEventParser,
+  nativeSessionFromEvent,
+  observationFailureEvidence,
 } from "../src/turns/engines.js";
 import { FakeWorkspaceRuntime } from "../src/workspaces/fake.js";
 import type {
@@ -86,6 +88,32 @@ class EngineRuntime implements WorkspaceRuntime {
 }
 
 describe("native agent engines", () => {
+  it.each([
+    [{ OPENAI_API_KEY: "project-key" }, "project-key"],
+    [{ OPENAI_API_KEY: "project-key", CODEX_API_KEY: "explicit-key" }, "explicit-key"],
+    [{ OPENAI_API_KEY: "project-key", CODEX_API_KEY: "" }, ""],
+    [{}, undefined],
+  ])("passes only the current request's Codex credential without mutating it", async (environment, expected) => {
+    const original = { ...environment };
+    const runtime = new EngineRuntime({
+      exitCode: 0,
+      stdout: '{"type":"thread.started","thread_id":"native"}\n',
+      stderr: "",
+      durationMs: 1,
+    });
+    await new CodexEngine(runtime).run({
+      turnId: "turn_credentials",
+      manifest: manifest("codex"),
+      workspace,
+      prompt: "work",
+      cwd: ".",
+      environment,
+    });
+    expect(runtime.command?.env?.CODEX_API_KEY).toBe(expected);
+    expect(environment).toEqual(original);
+    if (expected) expect(JSON.stringify(runtime.command?.args)).not.toContain(expected);
+  });
+
   it("parses chunked Claude stream-json and resumes with full access", async () => {
     const stdout = `${[
       JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session" }),
@@ -354,3 +382,29 @@ async function waitForFile(
   }
   throw new Error(`expected ${path} to be ${present ? "present" : "absent"}`);
 }
+
+describe("recovery evidence validation", () => {
+  it.each([
+    "../../private",
+    "secret\nvalue",
+    "x".repeat(201),
+    {},
+    null,
+  ])("rejects malformed native session identities", (thread_id) => {
+    expect(
+      nativeSessionFromEvent({ engine: "codex", type: "thread.started", data: { thread_id } }),
+    ).toBeUndefined();
+  });
+  it("excludes arbitrary provider payloads from structured evidence", () => {
+    expect(
+      observationFailureEvidence({
+        category: "workspace_session_lost",
+        httpStatus: 410,
+        headers: { authorization: "secret" },
+      }),
+    ).toEqual({ category: "workspace_session_lost", httpStatus: 410 });
+    expect(
+      observationFailureEvidence({ category: "private provider message", httpStatus: "secret" }),
+    ).toBeUndefined();
+  });
+});

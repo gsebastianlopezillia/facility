@@ -8,7 +8,12 @@ Facility serves Streamable HTTP MCP at `POST /mcp` from the control API. OAuth c
 resource metadata at `/.well-known/oauth-protected-resource/mcp`. API keys use the same endpoint
 with `Authorization: Bearer <key>`.
 
-The server exposes twenty task-oriented tools:
+With OAuth enabled, the resource metadata names the canonical MCP endpoint and its authorization
+server. Authorization-server metadata remains available at `/.well-known/oauth-authorization-server`
+and `/.well-known/openid-configuration`; all three discovery endpoints are public. MCP tool requests
+still require a valid bearer token.
+
+The server exposes twenty-one task-oriented tools:
 
 | Tool | Result |
 |---|---|
@@ -17,7 +22,7 @@ The server exposes twenty task-oriented tools:
 | `facility_list_skills` | Valid skills installed in `.agents/skills/` or `.claude/skills/`. |
 | `facility_list_stories` | Stories, optionally filtered by status. |
 | `facility_get_story` | Story, workspace, turns, artifacts, attention, and ordered evidence timeline. |
-| `facility_start_story` | Idempotently create or resume a story and queue its first message. |
+| `facility_start_story` | Idempotently create or resume a story and queue its first message. The title and agent are optional. |
 | `facility_send_message` | Append a message and queue the selected agent. |
 | `facility_get_conversation` | Read the shared ordered conversation. |
 | `facility_get_environment` | Read runtime, services, readiness, endpoints, and recent events. |
@@ -30,7 +35,8 @@ The server exposes twenty task-oriented tools:
 | `facility_get_budget` | Read the current monthly budget and amount spent. |
 | `facility_set_budget` | Enable, change, or disable the project's monthly budget. |
 | `facility_get_observability` | Read project health, usage, workspace, GitHub, and audit summaries. |
-| `facility_get_pipeline` | Read mirrored issues, pull requests, CI state, and story stage. |
+| `facility_list_backlog` | Read the unified backlog with phases, activity, assignees, search, filters, and pagination. |
+| `facility_list_attention` | Read what is waiting on a person, newest first, with the action each notice accepts; filter by status, kind, and text. |
 | `facility_sync_github` | Reconcile the project's GitHub mirror immediately. |
 
 ## Connect Claude Code or Codex
@@ -44,6 +50,11 @@ claude mcp add --transport http facility https://facility.example.com/mcp
 codex mcp add facility --url https://facility.example.com/mcp
 codex mcp login facility
 ```
+
+Clients must explicitly request `facility:mcp` for the MCP resource. For offline access, Facility
+collects consent and preserves `offline_access` in the refresh grant even when the client omits
+`prompt=consent`. See [OAuth scopes and renewal recovery](../self-host/authentication.md#mcp-interactive-oauth)
+if a previously authorized connection fails during refresh or rejects the callback issuer.
 
 Claude Code starts its OAuth flow when the server is first used. Codex can also read a service API
 key from an environment variable:

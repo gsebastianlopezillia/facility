@@ -15,6 +15,7 @@ import {
 } from "@facility/db";
 import { and, asc, desc, eq, isNull, notInArray, sql } from "drizzle-orm";
 import { appendStoryEvidence } from "../stories/evidence.js";
+import { isGithubIssueStory } from "../stories/phase.js";
 import type { StoryWorkspaceService } from "../stories/service.js";
 import { FacilityGithubClient, type GithubClientFactory } from "./client.js";
 
@@ -34,10 +35,12 @@ export class GithubMirrorService {
   async handleWebhook(input: {
     id: string;
     orgId: string;
+    projectId?: string;
+    repositoryId?: string;
     eventType: string;
     payload: JsonObject;
   }) {
-    const repository = await this.repositoryForPayload(input.orgId, input.payload);
+    const repository = await this.repositoryForPayload(input.orgId, input.payload, input);
     if (!repository) {
       return { mirrored: 0, branches: 0, reviews: 0, checks: 0, ciUpdated: 0 };
     }
@@ -138,7 +141,8 @@ export class GithubMirrorService {
         direction: "desc",
       });
       for (const pull of pullScan.rows) {
-        if (await this.upsertPullRequest(repository, pull)) pullRequests += 1;
+        const saved = await this.upsertPullRequest(repository, pull);
+        if (saved) pullRequests += 1;
         const pullNumber = positiveInteger(pull.number);
         const headSha = string(object(pull.head).sha);
         if (pullNumber && (await this.linkedStory(repository, { pullNumber, headSha }))) {
@@ -151,7 +155,7 @@ export class GithubMirrorService {
             reviews += await this.upsertReview(repository, review, pullNumber, headSha);
           }
         }
-        if (headSha) {
+        if (headSha && saved && shouldRefreshPullRequestCi(saved)) {
           const refreshed = await this.refreshCi(repository, client, pull);
           ciUpdates += refreshed.ciUpdates;
           checks += refreshed.checks;
@@ -192,7 +196,11 @@ export class GithubMirrorService {
     };
   }
 
-  private async repositoryForPayload(orgId: string, payload: JsonObject) {
+  private async repositoryForPayload(
+    orgId: string,
+    payload: JsonObject,
+    binding: { projectId?: string; repositoryId?: string },
+  ) {
     const repository = object(payload.repository);
     const fullName = string(repository.full_name)?.split("/") ?? [];
     const owner = string(object(repository.owner).login) ?? fullName[0];
@@ -206,6 +214,8 @@ export class GithubMirrorService {
           .where(
             and(
               eq(projectRepositories.orgId, orgId),
+              binding.projectId ? eq(projectRepositories.projectId, binding.projectId) : undefined,
+              binding.repositoryId ? eq(projectRepositories.id, binding.repositoryId) : undefined,
               eq(projectRepositories.owner, owner),
               eq(projectRepositories.name, name),
             ),
@@ -387,13 +397,14 @@ export class GithubMirrorService {
       syncedAt: now,
       updatedAt: now,
     };
-    return (
+    const saved =
       (
         await this.db
           .insert(githubIssues)
           .values(values)
           .onConflictDoUpdate({
             target: [githubIssues.repositoryId, githubIssues.number],
+            setWhere: sql`${githubIssues.githubUpdatedAt} is null or excluded.github_updated_at >= ${githubIssues.githubUpdatedAt}`,
             set: {
               title: values.title,
               body: values.body,
@@ -411,8 +422,25 @@ export class GithubMirrorService {
             },
           })
           .returning()
-      )[0] ?? null
-    );
+      )[0] ?? null;
+    if (saved && this.storiesService) {
+      const linked = await this.db
+        .select({ id: stories.id })
+        .from(stories)
+        .where(
+          and(
+            eq(stories.orgId, repository.orgId),
+            eq(stories.projectId, repository.projectId),
+            eq(stories.repositoryId, repository.id),
+            eq(stories.provider, "github"),
+            eq(stories.externalId, `issue:${number}`),
+            isNull(stories.deletedAt),
+          ),
+        );
+      for (const story of linked)
+        await this.storiesService.reconcileIssue(repository.orgId, repository.projectId, story.id);
+    }
+    return saved;
   }
 
   private async upsertPullRequest(repository: RepositoryRow, pull: JsonObject) {
@@ -543,7 +571,7 @@ export class GithubMirrorService {
     if (this.storiesService) {
       if (pull.state === "merged") {
         if (
-          story.status === "done" &&
+          (story.status === "done" || isGithubIssueStory(story)) &&
           story.pullRequestNumber === pull.number &&
           story.pullRequestUrl === pull.url &&
           story.branch === pull.branch
@@ -889,7 +917,22 @@ export class GithubMirrorService {
     let checks = 0;
     for (const check of checkRuns) checks += await this.upsertCheck(repository, check, pullNumber);
     const signal = restCiSignal(statusResponse, checkRunsResponse);
-    if (!signal) return { ciUpdates: 0, checks };
+    if (!signal) {
+      // Record the observation without inventing a successful CI result.
+      await this.db
+        .update(githubPullRequests)
+        .set({ ciHeadSha: headSha, ciUpdatedAt: new Date() })
+        .where(
+          and(
+            eq(githubPullRequests.orgId, repository.orgId),
+            eq(githubPullRequests.projectId, repository.projectId),
+            eq(githubPullRequests.repositoryId, repository.id),
+            eq(githubPullRequests.number, pullNumber),
+            eq(githubPullRequests.headSha, headSha),
+          ),
+        );
+      return { ciUpdates: 0, checks };
+    }
     const ciUpdates = await this.recordCi(repository, {
       pullNumber,
       headSha,
@@ -986,6 +1029,26 @@ export class GithubMirrorService {
   }
 }
 
+export function shouldRefreshPullRequestCi(pull: {
+  state: string;
+  headSha: string;
+  ciHeadSha: string | null;
+  ciState: string | null;
+  githubUpdatedAt: Date | null;
+  ciUpdatedAt: Date | null;
+}): boolean {
+  // Closed history has already been observed, even when its checks never
+  // finished or no checks existed. Polling those abandoned runs forever can
+  // exhaust the installation quota. New heads, repository updates and webhooks
+  // still reconcile them; open pulls always refresh.
+  return (
+    pull.state === "open" ||
+    pull.ciHeadSha !== pull.headSha ||
+    !pull.ciUpdatedAt ||
+    Boolean(pull.githubUpdatedAt && pull.githubUpdatedAt > pull.ciUpdatedAt)
+  );
+}
+
 async function paginated(
   client: FacilityGithubClient,
   route: string,
@@ -1045,7 +1108,7 @@ export function restCiSignal(
 ): { state: "pending" | "success" | "failure"; failureNames: string[] } | null {
   const status = object(commitStatus);
   const statuses = array(status.statuses).map(object);
-  const checkRuns = array(object(checkRunsResponse).check_runs).map(object);
+  const checkRuns = latestCheckRuns(array(object(checkRunsResponse).check_runs).map(object));
   const combinedState = ciState(status.state);
   if (!combinedState && statuses.length === 0 && checkRuns.length === 0) return null;
 
@@ -1063,10 +1126,33 @@ export function restCiSignal(
   if (combinedState === "failure" || failureNames.length > 0) {
     return { state: "failure", failureNames };
   }
-  if (combinedState === "pending" || checkRuns.some((check) => check.status !== "completed")) {
+  // GitHub returns pending with total_count:0 when a repository only uses
+  // check runs. That empty legacy status collection must not mask finished CI.
+  const pendingStatus =
+    combinedState === "pending" && !(status.total_count === 0 && checkRuns.length > 0);
+  if (pendingStatus || checkRuns.some((check) => check.status !== "completed")) {
     return { state: "pending", failureNames: [] };
   }
   return { state: "success", failureNames: [] };
+}
+
+/** A newer attempt supersedes the same check from the same GitHub App. */
+function latestCheckRuns(checks: JsonObject[]): JsonObject[] {
+  const latest = new Map<string, JsonObject>();
+  const unidentified: JsonObject[] = [];
+  for (const check of checks) {
+    const appId = positiveInteger(object(check.app).id);
+    const id = positiveInteger(check.id);
+    const name = string(check.name);
+    if (!appId || !id || !name) {
+      unidentified.push(check);
+      continue;
+    }
+    const key = JSON.stringify([appId, name]);
+    const previous = latest.get(key);
+    if (!previous || id > Number(previous.id)) latest.set(key, check);
+  }
+  return [...unidentified, ...latest.values()];
 }
 
 function conclusionState(value: unknown): "success" | "failure" | null {

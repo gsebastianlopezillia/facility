@@ -7,19 +7,31 @@ import { newId } from "@facility/core";
 import {
   attentionItems,
   createDb,
+  githubInstallations,
   migrate,
   orgs,
+  projectRepositories,
   projects,
   stories,
+  storyEvidenceEvents,
   storyMessages,
+  turnGitEvidence,
   turns,
   workspaces,
 } from "@facility/db";
 import { eq } from "drizzle-orm";
 import postgres from "postgres";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { GithubMirrorService } from "../src/github/mirror.js";
 import { StoryServiceError, StoryWorkspaceService } from "../src/stories/service.js";
+import { appendTurnEvent } from "../src/turns/events.js";
 import { FakeWorkspaceRuntime } from "../src/workspaces/fake.js";
+import {
+  parseProjectManifest,
+  projectWorkspaceInput,
+} from "../src/workspaces/project-environment.js";
+import type { CreateWorkspace } from "../src/workspaces/runtime.js";
+import { VercelWorkspaceRuntime } from "../src/workspaces/vercel.js";
 
 const databaseUrl =
   process.env.DATABASE_URL ?? "postgres://facility:facility@localhost:5461/facility_test";
@@ -73,6 +85,7 @@ describe("persistent story workspace lifecycle", async () => {
   const projectId = newId("proj");
   const otherOrgId = newId("org");
   const otherProjectId = newId("proj");
+  const repositoryId = newId("repo");
 
   beforeAll(async () => {
     await migrate(databaseUrl);
@@ -96,6 +109,25 @@ describe("persistent story workspace lifecycle", async () => {
         settings: {},
       },
     ]);
+    const installationId = newId("ghi");
+    await db.insert(githubInstallations).values({
+      id: installationId,
+      orgId,
+      installationId: Math.floor(Math.random() * 1_000_000_000) + 20_000,
+      accountId: 123,
+      accountLogin: "acme",
+      targetType: "Organization",
+    });
+    await db.insert(projectRepositories).values({
+      id: repositoryId,
+      orgId,
+      projectId,
+      installationId,
+      owner: "acme",
+      name: `app-${suffix}`,
+      defaultBranch: "main",
+      role: "primary",
+    });
   });
 
   afterAll(async () => {
@@ -121,6 +153,241 @@ describe("persistent story workspace lifecycle", async () => {
     };
   }
 
+  it.each([
+    "github",
+    "schedule",
+  ] as const)("recovers the same %s identity after a rejected resource pair without pinning invalid state", async (provider) => {
+    // Exercise the real provider's pure validation with local fake allocation only.
+    const validator = new VercelWorkspaceRuntime();
+    class ValidatedRuntime extends FakeWorkspaceRuntime {
+      validateCreate(input: Omit<CreateWorkspace, "id">) {
+        validator.validateCreate(input);
+      }
+      async create(input: CreateWorkspace) {
+        this.validateCreate(input);
+        return super.create(input);
+      }
+    }
+    const checkedRuntime = new ValidatedRuntime(join(root, `resources-${provider}`));
+    const create = vi.spyOn(checkedRuntime, "create");
+    const preflight = vi.spyOn(checkedRuntime, "validateCreate");
+    const checkedService = new StoryWorkspaceService(db, checkedRuntime);
+    const input = { ...startInput(`resources-${randomUUID()}`), provider };
+    const configuration = (memory: number) =>
+      projectWorkspaceInput(
+        parseProjectManifest(`
+repositories:
+  primary: github.com/acme/app
+environment:
+  start: "true"
+  resources: { cpu: 4, memory_mb: ${memory} }
+`),
+        "runner:test",
+      );
+
+    await expect(
+      checkedService.start({ ...input, workspace: configuration(4096) }),
+    ).rejects.toMatchObject({ code: "workspace_resources_invalid" });
+    expect(create).not.toHaveBeenCalled();
+    expect(
+      await db.select().from(stories).where(eq(stories.externalId, input.externalId)),
+    ).toHaveLength(0);
+
+    // Same identity and dedupe key: only the reviewed resource pair changed.
+    const created = await checkedService.start({ ...input, workspace: configuration(8192) });
+    expect(created.workspace?.state).toBe("running");
+    expect(created.workspace?.environment).toMatchObject({ resources: { cpu: 4, memoryMb: 8192 } });
+    expect(create).toHaveBeenCalledTimes(1);
+    if (!created.queued.turn) throw new Error("expected initial turn");
+    await checkedService.completeTurn({
+      orgId,
+      projectId,
+      turnId: created.queued.turn.id,
+      output: "done",
+      actor: input.actor,
+    });
+    await checkedService.suspend(orgId, projectId, created.story.id);
+    preflight.mockClear();
+
+    // A later bad manifest cannot block or resize an already allocated workspace.
+    const resumed = await checkedService.start({ ...input, workspace: configuration(4096) });
+    expect(resumed.workspace?.id).toBe(created.workspace?.id);
+    expect(resumed.workspace?.state).toBe("running");
+    expect(resumed.workspace?.environment).toMatchObject({ resources: { cpu: 4, memoryMb: 8192 } });
+    expect(preflight).not.toHaveBeenCalled();
+    expect(create).toHaveBeenCalledTimes(1);
+    // Original request plus the completed response; replay adds no new message.
+    expect(
+      await db.select().from(storyMessages).where(eq(storyMessages.storyId, created.story.id)),
+    ).toHaveLength(2);
+  });
+
+  async function branchFixture(workspaceId?: string) {
+    const result = await service.start({
+      ...startInput(`branch-${randomUUID()}`),
+      branch: "facility/original",
+    });
+    if (!result.workspace || !result.queued.turn) throw new Error("branch fixture missing");
+    const turn = result.queued.turn;
+    const workspace = result.workspace;
+    const finalBranch = `chore/${result.story.id}`;
+    await db.insert(turnGitEvidence).values({
+      turnId: result.queued.turn.id,
+      orgId,
+      projectId,
+      storyId: result.story.id,
+      workspaceId: workspaceId ?? result.workspace.id,
+      engineSessionId: "test-session",
+      initialBranch: "facility/original",
+      initialSha: "a".repeat(40),
+      finalBranch,
+      finalSha: "b".repeat(40),
+      completedAt: new Date(),
+    });
+    const complete = () =>
+      service.completeTurn({
+        orgId,
+        projectId,
+        turnId: turn.id,
+        output: "done",
+        actor: { type: "system", id: "test-engine" },
+      });
+    return { result, finalBranch, complete, turn, workspace };
+  }
+
+  it("follows completed native branch evidence once and permits the matching draft PR", async () => {
+    const fixture = await branchFixture();
+    await fixture.complete();
+    expect((await service.get(orgId, projectId, fixture.result.story.id)).story.branch).toBe(
+      fixture.finalBranch,
+    );
+    await fixture.complete();
+    const events = await db
+      .select()
+      .from(storyEvidenceEvents)
+      .where(eq(storyEvidenceEvents.storyId, fixture.result.story.id));
+    expect(events.filter((event) => event.type === "story.branch_updated")).toHaveLength(1);
+    await service.associatePullRequest({
+      orgId,
+      projectId,
+      storyId: fixture.result.story.id,
+      branch: fixture.finalBranch,
+      pullRequestNumber: 1549,
+      pullRequestUrl: "https://github.com/acme/app/pull/1549",
+    });
+    expect(
+      (await service.get(orgId, projectId, fixture.result.story.id)).story.pullRequestNumber,
+    ).toBe(1549);
+  });
+
+  it("does not use another story's workspace evidence or cross-tenant calls", async () => {
+    const other = await branchFixture();
+    const fixture = await branchFixture(other.workspace.id);
+    await expect(
+      service.completeTurn({
+        orgId: otherOrgId,
+        projectId: otherProjectId,
+        turnId: fixture.turn.id,
+        output: "done",
+        actor: { type: "system", id: "test" },
+      }),
+    ).rejects.toMatchObject({ code: "turn_not_found" });
+    await fixture.complete();
+    expect((await service.get(orgId, projectId, fixture.result.story.id)).story.branch).toBe(
+      "facility/original",
+    );
+  });
+
+  it("preserves an existing PR and a concurrent operator branch change", async () => {
+    const linked = await branchFixture();
+    await service.associatePullRequest({
+      orgId,
+      projectId,
+      storyId: linked.result.story.id,
+      branch: "facility/original",
+      pullRequestNumber: 41,
+    });
+    await linked.complete();
+    expect((await service.get(orgId, projectId, linked.result.story.id)).story).toMatchObject({
+      branch: "facility/original",
+      pullRequestNumber: 41,
+    });
+    const changed = await branchFixture();
+    await db
+      .update(stories)
+      .set({ branch: "fix/operator" })
+      .where(eq(stories.id, changed.result.story.id));
+    await changed.complete();
+    expect((await service.get(orgId, projectId, changed.result.story.id)).story.branch).toBe(
+      "fix/operator",
+    );
+  });
+
+  it("does not claim a branch already assigned to another story", async () => {
+    const fixture = await branchFixture();
+    const other = await service.start({
+      ...startInput(`conflict-${randomUUID()}`),
+      repositoryId,
+      branch: fixture.finalBranch,
+    });
+    await fixture.complete();
+    expect((await service.get(orgId, projectId, fixture.result.story.id)).story.branch).toBe(
+      "facility/original",
+    );
+    expect((await service.get(orgId, projectId, other.story.id)).story.branch).toBe(
+      fixture.finalBranch,
+    );
+  });
+
+  it("does not replay an older turn's branch after a newer request", async () => {
+    const fixture = await branchFixture();
+    await fixture.complete();
+    await service.queueMessage({
+      orgId,
+      projectId,
+      storyId: fixture.result.story.id,
+      body: "Continue",
+      dedupeKey: randomUUID(),
+      agent: builder,
+      actor: { type: "user", id: "test" },
+      trigger: { type: "manual" },
+    });
+    await db
+      .update(stories)
+      .set({ branch: "facility/original" })
+      .where(eq(stories.id, fixture.result.story.id));
+    await fixture.complete();
+    expect((await service.get(orgId, projectId, fixture.result.story.id)).story.branch).toBe(
+      "facility/original",
+    );
+  });
+
+  it.each([
+    ["failed capture", { captureError: "git failed" }],
+    ["incomplete capture", { completedAt: null }],
+    ["default branch", { finalBranch: "main" }],
+    ["malformed branch", { finalBranch: "--force" }],
+  ])("does not follow %s in persisted evidence", async (_name, values) => {
+    const fixture = await branchFixture();
+    await db.update(turnGitEvidence).set(values).where(eq(turnGitEvidence.turnId, fixture.turn.id));
+    await fixture.complete();
+    expect((await service.get(orgId, projectId, fixture.result.story.id)).story.branch).toBe(
+      "facility/original",
+    );
+  });
+
+  it("does not follow evidence from a destroyed workspace", async () => {
+    const fixture = await branchFixture();
+    await db
+      .update(workspaces)
+      .set({ state: "destroyed", destroyedAt: new Date() })
+      .where(eq(workspaces.id, fixture.workspace.id));
+    await fixture.complete();
+    expect((await service.get(orgId, projectId, fixture.result.story.id)).story.branch).toBe(
+      "facility/original",
+    );
+  });
+
   it("starts idempotently and serializes messages behind the active turn", async () => {
     const externalId = `issue-${randomUUID()}`;
     const first = await service.start(startInput(externalId));
@@ -145,6 +412,48 @@ describe("persistent story workspace lifecycle", async () => {
     expect(queued.turn).toBeUndefined();
     expect(await db.select().from(turns).where(eq(turns.storyId, first.story.id))).toHaveLength(1);
     expect(await service.conversation(orgId, projectId, first.story.id)).toHaveLength(2);
+  });
+
+  it("pages newest conversation messages without losing older history or crossing scope", async () => {
+    const result = await service.start(startInput(`pagination-${randomUUID()}`));
+    const first = result.queued.message;
+    await db.insert(storyMessages).values(
+      Array.from({ length: 205 }, (_, i) => ({
+        id: newId("msg"),
+        orgId,
+        projectId,
+        storyId: result.story.id,
+        conversationId: first.conversationId,
+        seq: i + 2,
+        role: "user",
+        body: `Message ${i + 2}`,
+        actor: { type: "user", id: "test" },
+      })),
+    );
+    const latest = await service.conversation(orgId, projectId, result.story.id, {
+      order: "desc",
+      limit: 200,
+    });
+    expect(latest).toHaveLength(200);
+    expect(latest[0]?.seq).toBe(206);
+    expect(latest[199]?.seq).toBe(7);
+    const older = await service.conversation(orgId, projectId, result.story.id, {
+      order: "desc",
+      before: 7,
+      limit: 200,
+    });
+    expect(older.map((message) => message.seq)).toEqual([6, 5, 4, 3, 2, 1]);
+    expect(
+      (await service.conversation(orgId, projectId, result.story.id, { after: 200 })).map(
+        (message) => message.seq,
+      ),
+    ).toEqual([201, 202, 203, 204, 205, 206]);
+    await expect(
+      service.conversation(otherOrgId, otherProjectId, result.story.id, { order: "desc" }),
+    ).rejects.toThrow();
+    await expect(
+      service.conversation(orgId, otherProjectId, result.story.id, { order: "desc" }),
+    ).rejects.toThrow();
   });
 
   it("keeps the worktree and native session state across archive, compute replacement, restore, and merge", async () => {
@@ -185,6 +494,336 @@ describe("persistent story workspace lifecycle", async () => {
     expect(merged.story.status).toBe("done");
     expect(merged.workspace?.state).toBe("sleeping");
     expect(await runtime.read(locator, "repos/app/HEAD")).toBe("commit-a");
+  });
+
+  async function issueFixture(number: number) {
+    const result = await service.start({ ...startInput(`issue:${number}`), repositoryId });
+    const mirror = new GithubMirrorService(
+      db,
+      async () => {
+        throw new Error("no external GitHub call expected");
+      },
+      service,
+    );
+    const observe = (
+      state: "open" | "closed",
+      at: string,
+      scope = { orgId, projectId, repositoryId },
+    ) =>
+      mirror.handleWebhook({
+        id: randomUUID(),
+        ...scope,
+        eventType: "issues",
+        payload: {
+          action: state === "closed" ? "closed" : "reopened",
+          repository: { name: `app-${suffix}`, owner: { login: "acme" } },
+          issue: {
+            number,
+            title: "Source issue",
+            html_url: `https://github.com/acme/app/issues/${number}`,
+            state,
+            updated_at: at,
+            closed_at: state === "closed" ? at : null,
+          },
+        },
+      });
+    const finish = async () => {
+      if (!result.queued.turn) throw new Error("missing turn");
+      await service.completeTurn({
+        orgId,
+        projectId,
+        turnId: result.queued.turn.id,
+        output: "done",
+        actor: { type: "system", id: "test" },
+      });
+    };
+    const merge = () =>
+      service.markMerged({
+        orgId,
+        projectId,
+        storyId: result.story.id,
+        pullRequestNumber: number,
+        pullRequestUrl: `https://github.com/acme/app/pull/${number}`,
+        branch: `feature/${number}`,
+      });
+    return { result, observe, finish, merge };
+  }
+
+  it("keeps an issue-backed workspace on PR merge, then suspends on issue closure and retains it on reopen", async () => {
+    const f = await issueFixture(7001);
+    await f.finish();
+    await f.observe("open", "2026-09-30T10:00:00Z");
+    const merged = await f.merge();
+    expect(merged.story).toMatchObject({
+      status: "working",
+      completedAt: null,
+      pullRequestNumber: 7001,
+    });
+    expect(merged.workspace?.state).toBe("running");
+    const stop = vi.spyOn(runtime, "suspend"),
+      destroy = vi.spyOn(runtime, "destroy"),
+      wake = vi.spyOn(runtime, "wake");
+    try {
+      await f.observe("closed", "2026-09-30T11:00:00Z");
+      const closed = await service.get(orgId, projectId, f.result.story.id);
+      expect(closed.story.status).toBe("done");
+      expect(closed.workspace).toMatchObject({
+        state: "sleeping",
+        id: f.result.workspace?.id,
+        volumeRef: f.result.workspace?.volumeRef,
+      });
+      await f.observe("closed", "2026-09-30T11:00:00Z");
+      expect(stop).toHaveBeenCalledTimes(1);
+      await f.observe("open", "2026-09-30T12:00:00Z");
+      // An out-of-order close must not re-close the issue after reopen.
+      await f.observe("closed", "2026-09-30T11:00:00Z");
+      const reopened = await service.get(orgId, projectId, f.result.story.id);
+      expect(reopened.story).toMatchObject({ status: "working", completedAt: null });
+      expect(reopened.workspace).toMatchObject({
+        state: "sleeping",
+        volumeRef: closed.workspace?.volumeRef,
+      });
+      expect(wake).not.toHaveBeenCalled();
+      expect(destroy).not.toHaveBeenCalled();
+      await service.restore(orgId, projectId, f.result.story.id);
+      await f.observe("closed", "2026-09-30T13:00:00Z");
+      expect(stop).toHaveBeenCalledTimes(2);
+      await service.restore(orgId, projectId, f.result.story.id);
+      await f.observe("closed", "2026-09-30T13:00:00Z");
+      expect(stop).toHaveBeenCalledTimes(2);
+      expect((await service.get(orgId, projectId, f.result.story.id)).workspace?.state).toBe(
+        "running",
+      );
+    } finally {
+      stop.mockRestore();
+      destroy.mockRestore();
+      wake.mockRestore();
+    }
+  });
+
+  it("does not interrupt an active issue turn and retries closure after it settles", async () => {
+    const f = await issueFixture(7002);
+    await f.observe("closed", "2026-09-30T10:00:00Z");
+    expect((await service.get(orgId, projectId, f.result.story.id)).workspace?.state).toBe(
+      "running",
+    );
+    await f.finish();
+    const stop = vi
+      .spyOn(runtime, "suspend")
+      .mockRejectedValueOnce(new Error("provider unavailable"));
+    try {
+      await expect(f.observe("closed", "2026-09-30T10:00:00Z")).rejects.toThrow(
+        "provider unavailable",
+      );
+      expect((await service.get(orgId, projectId, f.result.story.id)).story.status).toBe("working");
+      await f.observe("closed", "2026-09-30T10:00:00Z");
+      expect((await service.get(orgId, projectId, f.result.story.id)).workspace?.state).toBe(
+        "sleeping",
+      );
+    } finally {
+      stop.mockRestore();
+    }
+  });
+
+  it("repairs legacy issue completion without a wake, and rejects wrong tenant/repository signals", async () => {
+    const f = await issueFixture(7003);
+    await f.finish();
+    await f.observe("open", "2026-09-30T10:00:00Z");
+    await db
+      .update(stories)
+      .set({ status: "done", completedAt: new Date() })
+      .where(eq(stories.id, f.result.story.id));
+    const wake = vi.spyOn(runtime, "wake");
+    try {
+      await f.observe("open", "2026-09-30T10:00:00Z");
+      expect((await service.get(orgId, projectId, f.result.story.id)).story).toMatchObject({
+        status: "working",
+        completedAt: null,
+      });
+      await f.observe("closed", "2026-09-30T11:00:00Z", {
+        orgId: otherOrgId,
+        projectId: otherProjectId,
+        repositoryId,
+      });
+      await f.observe("closed", "2026-09-30T11:00:00Z", {
+        orgId,
+        projectId,
+        repositoryId: newId("repo"),
+      });
+      expect((await service.get(orgId, projectId, f.result.story.id)).story.status).toBe("working");
+      await service.archive(orgId, projectId, f.result.story.id);
+      await f.observe("open", "2026-09-30T12:00:00Z");
+      expect((await service.get(orgId, projectId, f.result.story.id)).story.status).toBe(
+        "archived",
+      );
+      expect(wake).not.toHaveBeenCalled();
+    } finally {
+      wake.mockRestore();
+    }
+  });
+
+  it("suspends failed idle workspaces, retains files, and respects explicit wake", async () => {
+    const result = await service.start(startInput(`issue-${randomUUID()}`));
+    const turnId = result.queued.turn?.id;
+    if (!turnId) throw new Error("turn fixture missing");
+    const workspace = result.workspace;
+    if (!workspace?.externalRef) throw new Error("workspace fixture missing");
+    const locator = {
+      id: workspace.id,
+      externalRef: workspace.externalRef,
+      volumeRef: workspace.volumeRef,
+      image: "facility-runner:test",
+    };
+    await runtime.exec(locator, {
+      command: "sh",
+      args: ["-c", "printf 'recoverable changes' > partial-work.txt"],
+    });
+    await service.failTurn({ orgId, projectId, turnId, error: "observation unavailable" });
+    await expect(service.suspendFailedWorkspace(orgId, projectId, result.story.id)).resolves.toBe(
+      true,
+    );
+    expect((await service.get(orgId, projectId, result.story.id)).workspace?.state).toBe(
+      "sleeping",
+    );
+    expect(await runtime.read(locator, "partial-work.txt")).toBe("recoverable changes");
+    await expect(service.suspendFailedWorkspace(orgId, projectId, result.story.id)).resolves.toBe(
+      false,
+    );
+    await service.restore(orgId, projectId, result.story.id);
+    await expect(service.suspendFailedWorkspace(orgId, projectId, result.story.id)).resolves.toBe(
+      false,
+    );
+    expect((await service.get(orgId, projectId, result.story.id)).workspace?.state).toBe("running");
+  });
+
+  it("retries a failed suspension without claiming the machine stopped", async () => {
+    const result = await service.start(startInput(`issue-${randomUUID()}`));
+    if (!result.queued.turn) throw new Error("turn fixture missing");
+    await service.failTurn({ orgId, projectId, turnId: result.queued.turn.id, error: "failed" });
+    const stop = vi
+      .spyOn(runtime, "suspend")
+      .mockRejectedValueOnce(new Error("provider unavailable"));
+    try {
+      await expect(service.suspendFailedWorkspace(orgId, projectId, result.story.id)).resolves.toBe(
+        false,
+      );
+      expect((await service.get(orgId, projectId, result.story.id)).workspace?.state).toBe(
+        "running",
+      );
+      expect(await service.suspendFailedWorkspaces()).toBeGreaterThanOrEqual(1);
+      expect((await service.get(orgId, projectId, result.story.id)).workspace?.state).toBe(
+        "sleeping",
+      );
+    } finally {
+      stop.mockRestore();
+    }
+  });
+
+  it("denies cross-tenant cleanup and leaves queued or running work alone", async () => {
+    const result = await service.start(startInput(`issue-${randomUUID()}`));
+    const stop = vi.spyOn(runtime, "suspend");
+    try {
+      await expect(
+        service.suspendFailedWorkspace(otherOrgId, otherProjectId, result.story.id),
+      ).rejects.toThrow();
+      await expect(
+        service.suspendFailedWorkspace(orgId, otherProjectId, result.story.id),
+      ).rejects.toThrow();
+      await expect(service.suspendFailedWorkspace(orgId, projectId, result.story.id)).resolves.toBe(
+        false,
+      );
+      if (!result.queued.turn) throw new Error("turn fixture missing");
+      await db.update(turns).set({ state: "running" }).where(eq(turns.id, result.queued.turn.id));
+      await expect(service.suspendFailedWorkspace(orgId, projectId, result.story.id)).resolves.toBe(
+        false,
+      );
+      expect(stop).not.toHaveBeenCalled();
+    } finally {
+      stop.mockRestore();
+    }
+  });
+
+  it("does not treat a health event as a worker heartbeat", async () => {
+    const result = await service.start(startInput(`issue-${randomUUID()}`));
+    if (!result.queued.turn) throw new Error("turn fixture missing");
+    const stale = new Date(Date.now() - 600_000);
+    await db
+      .update(turns)
+      .set({ state: "running", updatedAt: stale })
+      .where(eq(turns.id, result.queued.turn.id));
+    await appendTurnEvent(db, {
+      orgId,
+      projectId,
+      storyId: result.story.id,
+      turnId: result.queued.turn.id,
+      type: "workspace.health",
+      data: { probe: "unavailable" },
+    });
+    const [turn] = await db.select().from(turns).where(eq(turns.id, result.queued.turn.id));
+    expect(turn?.updatedAt).toEqual(stale);
+    await expect(
+      service.recoverInterruptedTurn({
+        orgId,
+        projectId,
+        turnId: result.queued.turn.id,
+        staleBefore: new Date(Date.now() - 120_000),
+      }),
+    ).resolves.toBe(true);
+    await expect(service.suspendFailedWorkspace(orgId, projectId, result.story.id)).resolves.toBe(
+      true,
+    );
+  });
+
+  it("serializes suspension with a new task and protects an already queued successor", async () => {
+    const result = await service.start(startInput(`issue-${randomUUID()}`));
+    if (!result.queued.turn) throw new Error("turn fixture missing");
+    await service.failTurn({ orgId, projectId, turnId: result.queued.turn.id, error: "failed" });
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const original = runtime.suspend.bind(runtime);
+    const stop = vi.spyOn(runtime, "suspend").mockImplementationOnce(async (workspace) => {
+      await gate;
+      await original(workspace);
+    });
+    const cleanup = service.suspendFailedWorkspace(orgId, projectId, result.story.id);
+    let queued = false;
+    try {
+      await vi.waitFor(() => expect(stop).toHaveBeenCalledOnce());
+      const next = service
+        .queueMessage({
+          orgId,
+          projectId,
+          storyId: result.story.id,
+          body: "Continue retained work",
+          dedupeKey: randomUUID(),
+          agent: builder,
+          actor: { type: "user", id: "user_test" },
+          trigger: { type: "manual" },
+        })
+        .then((value) => {
+          queued = true;
+          return value;
+        });
+      expect(queued).toBe(false);
+      release();
+      expect(await cleanup).toBe(true);
+      expect((await next).turn?.state).toBe("queued");
+      // Even if the machine is manually running, queued work wins over old failure.
+      await db
+        .update(workspaces)
+        .set({ state: "running", updatedAt: new Date(0) })
+        .where(eq(workspaces.storyId, result.story.id));
+      await expect(service.suspendFailedWorkspace(orgId, projectId, result.story.id)).resolves.toBe(
+        false,
+      );
+      expect(stop).toHaveBeenCalledOnce();
+    } finally {
+      release();
+      stop.mockRestore();
+      await cleanup;
+    }
   });
 
   it("does not let a late turn result override archive or merge", async () => {

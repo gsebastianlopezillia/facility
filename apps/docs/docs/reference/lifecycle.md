@@ -72,6 +72,27 @@ The runtime provider implements create, wake, execute, expose, inspect, suspend,
 Docker workspace uses a named volume independent of its replaceable container. Vercel uses durable
 snapshot-backed state while renewing finite compute leases.
 
+When a Vercel workspace resumes, Docker startup distinguishes a live daemon from a stale PID file
+retained in the snapshot. It waits for a live daemon, or removes stale PID and socket files before
+starting one. A recycled PID is never signaled. Bootstrap preserves ownership inside Docker layers
+and volumes so container data survives the resume.
+
+New daemons use an execution-state directory tied to the kernel boot ID. Restoring a snapshot
+therefore cannot reuse runc process state from an earlier VM, while Docker's persistent data stays
+in `/workspace/.facility/docker`. Container restart policies still apply: a container deliberately
+stopped with `unless-stopped` remains stopped. A missing or malformed boot ID prevents startup.
+
+Vercel agent commands start once and emit sequenced output and exit events to both a live stream
+and a durable journal in their workspace. An exit event can complete observation even when the
+provider's status endpoint is unavailable. If streaming disconnects, Facility reads the journal
+and skips events already delivered, preserving output order without restarting the command.
+
+Each journal read and completion wait is limited to 30 seconds. An expired completion wait is
+renewed; transient read failures retry with backoff until the command's overall deadline or an
+explicit cancellation. A read timeout alone does not stop the agent. Permanent access failures
+and invalid journal data remain errors. Run details record when observation is recovering or
+restored, including the operation, retry count, elapsed time, and next sequence number.
+
 ## Operations
 
 ### Send message
@@ -88,6 +109,23 @@ or external GitHub effects that already occurred.
 
 Retry asks Facility to attempt recoverable work again. Dismiss closes an obsolete attention item.
 A waiting-agent item is normally resolved by a user reply.
+
+### Open preview
+
+Opens the service in the same persistent workspace used by the story's agents. Once prepared,
+preview access preserves the current Git branch, uncommitted files, native sessions, and local
+data. It does not fetch or switch Git, rerun setup, or reseed. A declared `environment.ready`
+command lets Facility reuse healthy services; otherwise it runs `environment.start` on each open.
+A sleeping workspace wakes with its retained files. First-time preparation still runs normally;
+use **Clean setup** to apply repository or setup changes that require preparation again.
+
+Opt-in native Vercel previews (`FACILITY_NATIVE_PREVIEWS=1`) use the Sandbox URL
+and Facility login. A user with `previews:read` can open an already-running,
+prepared native preview without execution permission; that action never wakes
+compute or runs setup/start. `workspaces:execute` retains preparation/wake behavior.
+There is no per-story preview ACL. Application authentication remains separate.
+Native URL stability across suspend/resume must be verified with the provider;
+the story lifecycle reports the latest verified origin for callback reconciliation.
 
 ### Clean setup
 
@@ -128,3 +166,8 @@ Facility does not automatically delete workspaces after merge, archive, error, o
 Operators must monitor active compute and retained storage, define backup and retention rules, and
 use deletion deliberately. Project budgets and cost views support that decision but do not turn
 unknown provider pricing into zero.
+
+Vercel resume removes stale Docker/containerd runtime files only when the recorded
+Docker daemon is absent. A retained preview PID is signaled only when its command
+line matches the gateway and both ports. Docker readiness failures identify the
+retained daemon log. Existing container-file ownership is preserved, not repaired.

@@ -5,6 +5,16 @@ override_data {
   values = { names = ["us-east-1a", "us-east-1b"] }
 }
 
+override_data {
+  target = data.aws_caller_identity.current
+  values = { account_id = "123456789012" }
+}
+
+override_data {
+  target = data.aws_partition.current
+  values = { partition = "aws" }
+}
+
 run "vercel_workspace_control_plane" {
   command = plan
 
@@ -42,8 +52,35 @@ run "vercel_workspace_control_plane" {
   }
 
   assert {
+    condition     = contains(local.services.worker.environment, { name = "FACILITY_WORKER_TASK_PROTECTION", value = "ecs" }) && !contains(local.services.api.environment, { name = "FACILITY_WORKER_TASK_PROTECTION", value = "ecs" })
+    error_message = "Only the worker should enable task protection."
+  }
+
+  assert {
+    condition = jsondecode(aws_iam_role_policy.worker_task_protection.policy).Statement == [{
+      Effect   = "Allow"
+      Action   = ["ecs:GetTaskProtection", "ecs:UpdateTaskProtection"]
+      Resource = "arn:aws:ecs:us-east-1:123456789012:task/facility-production/*"
+    }]
+    error_message = "Task protection must grant only protection operations on this cluster's tasks."
+  }
+
+  assert {
     condition     = length(aws_ecr_repository.service) == 2
     error_message = "The control plane should build only API and web images in AWS."
+  }
+
+  assert {
+    condition = length(aws_ecr_lifecycle_policy.service) == 2 && alltrue([
+      for policy in aws_ecr_lifecycle_policy.service : length(jsondecode(policy.policy).rules) > 0 && alltrue([
+        for rule in jsondecode(policy.policy).rules :
+        rule.selection.tagStatus == "untagged" &&
+        rule.selection.countType == "sinceImagePushed" &&
+        rule.selection.countUnit == "days" &&
+        rule.selection.countNumber >= 30
+      ])
+    ])
+    error_message = "Image expiration must preserve tagged deployments and rollback images, removing only untagged images at least 30 days old."
   }
 
   assert {

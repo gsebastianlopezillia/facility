@@ -12,7 +12,9 @@ import type {
   WorkspaceRepository,
 } from "../github/workspace-credentials.js";
 import { appendWorkspaceEvent } from "./events.js";
+import { isSafeGitBranch } from "./git-branch.js";
 import type {
+  CreateWorkspace,
   PreviewEndpoint,
   WorkspaceCommandResult,
   WorkspaceLocator,
@@ -55,6 +57,13 @@ export const ProjectManifestSchema = z
     environment: z
       .object({
         image: z.string().min(1).max(500).optional(),
+        resources: z
+          .object({
+            cpu: z.number().int().min(1).max(32),
+            memory_mb: z.number().int().min(512).max(65_536),
+          })
+          .strict()
+          .optional(),
         setup: z.string().min(1).max(4_000).optional(),
         start: z.string().min(1).max(4_000),
         ready: z.string().min(1).max(4_000).optional(),
@@ -70,6 +79,24 @@ export const ProjectManifestSchema = z
   .strict();
 
 export type ProjectManifest = z.infer<typeof ProjectManifestSchema> & { hash: string };
+
+/** One creation contract for API/UI/MCP, GitHub triggers and scheduled stories. */
+export function projectWorkspaceInput(
+  manifest: ProjectManifest,
+  defaultImage: string,
+): Omit<CreateWorkspace, "id"> {
+  const resources = manifest.environment.resources;
+  return {
+    image: manifest.environment.image ?? defaultImage,
+    ...(resources ? { resources: { cpu: resources.cpu, memoryMb: resources.memory_mb } } : {}),
+    ports: Object.entries(manifest.environment.services).map(([service, value]) => ({
+      service,
+      port: value.port,
+      protocol: value.protocol,
+      websocket: value.websocket,
+    })),
+  };
+}
 
 export class ProjectEnvironmentError extends Error {
   constructor(
@@ -173,6 +200,15 @@ export class GithubProjectManifestSource implements ProjectManifestSource {
   }
 }
 
+type EnvironmentInput = {
+  orgId: string;
+  projectId: string;
+  workspace: WorkspaceLocator;
+  manifest: ProjectManifest;
+  credentials: GithubWorkspaceCredentials;
+  readinessTimeoutMs?: number;
+};
+
 export class ProjectEnvironmentService {
   constructor(
     private readonly db: FacilityDb,
@@ -182,21 +218,22 @@ export class ProjectEnvironmentService {
       projectId,
       name,
     ) => process.env[projectEnvironmentVariableName(projectId, name)],
+    private readonly workspaceValues: (scope: {
+      orgId: string;
+      projectId: string;
+      workspaceId: string;
+    }) => Promise<Record<string, string>> = async () => ({}),
   ) {}
 
-  async prepare(input: {
-    orgId: string;
-    projectId: string;
-    workspace: WorkspaceLocator;
-    manifest: ProjectManifest;
-    credentials: GithubWorkspaceCredentials;
-    branch: string;
-    previousSetupChecksum?: string | null;
-    cleanSetup?: boolean;
-    readinessTimeoutMs?: number;
-  }) {
+  async prepare(
+    input: EnvironmentInput & {
+      branch: string;
+      previousSetupChecksum?: string | null;
+      cleanSetup?: boolean;
+    },
+  ) {
     assertRepositoryContract(input.manifest, input.credentials.repositories);
-    const preparedInput = this.withDeclaredEnvironment(input);
+    const preparedInput = await this.withDeclaredEnvironment(input);
     await this.run(preparedInput, "mkdir -p repos", ".", "environment.repositories");
     for (const repository of preparedInput.credentials.repositories) {
       await this.runCommand(
@@ -225,14 +262,14 @@ export class ProjectEnvironmentService {
       await this.runCommand(
         preparedInput,
         "git",
-        ["config", "user.name", "Facility Agent"],
+        ["config", "user.name", preparedInput.credentials.gitIdentity.name],
         cwd,
         "git identity",
       );
       await this.runCommand(
         preparedInput,
         "git",
-        ["config", "user.email", "facility-agent@users.noreply.github.com"],
+        ["config", "user.email", preparedInput.credentials.gitIdentity.email],
         cwd,
         "git identity",
       );
@@ -241,20 +278,22 @@ export class ProjectEnvironmentService {
 
     const setupChecksum = await this.setupChecksum(preparedInput);
     const setupRequired = input.cleanSetup || input.previousSetupChecksum !== setupChecksum;
-    if (preparedInput.manifest.environment.setup && setupRequired) {
-      await this.run(
-        preparedInput,
-        preparedInput.manifest.environment.setup,
-        primaryPath(preparedInput.credentials),
-        "environment.setup",
-      );
-      if (preparedInput.manifest.environment.seed) {
+    if (setupRequired) {
+      if (preparedInput.manifest.environment.setup) {
         await this.run(
           preparedInput,
-          preparedInput.manifest.environment.seed,
+          preparedInput.manifest.environment.setup,
           primaryPath(preparedInput.credentials),
-          "environment.seed",
+          "environment.setup",
         );
+        if (preparedInput.manifest.environment.seed) {
+          await this.run(
+            preparedInput,
+            preparedInput.manifest.environment.seed,
+            primaryPath(preparedInput.credentials),
+            "environment.seed",
+          );
+        }
       }
       await this.db
         .update(workspaces)
@@ -266,17 +305,57 @@ export class ProjectEnvironmentService {
           ),
         );
     }
-    await this.run(
-      preparedInput,
-      preparedInput.manifest.environment.start,
-      primaryPath(preparedInput.credentials),
-      "environment.start",
-    );
-    if (preparedInput.manifest.environment.ready) await this.waitUntilReady(preparedInput);
+    return this.startServices(preparedInput, setupChecksum);
+  }
+
+  /** Reuse the agent's files and data; preview access must never prepare Git or reseed. */
+  async startPrepared(input: EnvironmentInput & { setupChecksum: string }) {
+    assertRepositoryContract(input.manifest, input.credentials.repositories);
+    const preparedInput = await this.withDeclaredEnvironment(input);
+    const ready = preparedInput.manifest.environment.ready;
+    const alreadyReady = ready
+      ? (await this.command(preparedInput, ready, primaryPath(preparedInput.credentials)))
+          .exitCode === 0
+      : false;
+    return this.startServices(preparedInput, input.setupChecksum, alreadyReady);
+  }
+
+  private async startServices(
+    preparedInput: EnvironmentInput,
+    setupChecksum: string,
+    alreadyReady = false,
+  ) {
+    if (!alreadyReady) {
+      await this.run(
+        preparedInput,
+        preparedInput.manifest.environment.start,
+        primaryPath(preparedInput.credentials),
+        "environment.start",
+      );
+      if (preparedInput.manifest.environment.ready) await this.waitUntilReady(preparedInput);
+    }
     const endpoints = await this.runtime.expose(
       preparedInput.workspace,
       services(preparedInput.manifest),
     );
+    const setupOrigins = preparedInput.credentials.environment.FACILITY_PREVIEW_ORIGINS;
+    if (setupOrigins) {
+      const origins = JSON.parse(setupOrigins) as Record<string, string>;
+      for (const [service, origin] of Object.entries(origins)) {
+        if (
+          !endpoints.some(
+            (endpoint) =>
+              endpoint.service === service &&
+              endpoint.access === "native" &&
+              endpoint.url === origin,
+          )
+        )
+          throw new ProjectEnvironmentError(
+            "project_preview_origin_changed",
+            "Preview origin changed during setup; refusing to publish a mismatched application",
+          );
+      }
+    }
     await this.db
       .update(workspaces)
       .set({
@@ -307,6 +386,7 @@ export class ProjectEnvironmentService {
       primaryCwd: primaryPath(preparedInput.credentials),
       setupChecksum,
       processEnvironment: preparedInput.credentials.environment,
+      secretNames: preparedInput.manifest.environment.secrets,
     };
   }
 
@@ -326,7 +406,7 @@ export class ProjectEnvironmentService {
         ".facility.yml does not define environment.browser_test",
       );
     }
-    const preparedInput = this.withDeclaredEnvironment({ ...input, branch: "browser-test" });
+    const preparedInput = await this.withDeclaredEnvironment({ ...input, branch: "browser-test" });
     const artifactDirectory = `.facility/artifacts/browser-${Date.now()}`;
     await this.runCommand(
       preparedInput,
@@ -389,19 +469,38 @@ export class ProjectEnvironmentService {
     return { result: safeResult, artifacts };
   }
 
-  private withDeclaredEnvironment<
+  private async withDeclaredEnvironment<
     T extends {
+      orgId: string;
       projectId: string;
+      workspace: WorkspaceLocator;
       manifest: ProjectManifest;
       credentials: GithubWorkspaceCredentials;
     },
-  >(input: T): T {
+  >(input: T): Promise<T> {
+    const managed = await this.workspaceValues({
+      orgId: input.orgId,
+      projectId: input.projectId,
+      workspaceId: input.workspace.id,
+    });
     const names = [...input.manifest.environment.variables, ...input.manifest.environment.secrets];
+    const originsName = "FACILITY_PREVIEW_ORIGINS";
+    const origins = names.includes(originsName)
+      ? await this.runtime.previewOrigins?.(input.workspace, services(input.manifest))
+      : undefined;
+    const originsValue =
+      origins && Object.keys(origins).length ? JSON.stringify(origins) : undefined;
     const values: Record<string, string> = {};
     const missing: Array<{ name: string; operatorName: string }> = [];
     for (const name of names) {
       const operatorName = projectEnvironmentVariableName(input.projectId, name);
-      const value = this.environmentValue(input.projectId, name);
+      // This reserved value comes only from the scoped runtime, never operator,
+      // managed or repository credentials. Unsupported/opted-out providers fail
+      // only manifests that explicitly request it; legacy projects are unchanged.
+      const value =
+        name === originsName
+          ? originsValue
+          : (managed[name] ?? this.environmentValue(input.projectId, name));
       if (value === undefined) missing.push({ name, operatorName });
       else values[name] = value;
     }
@@ -412,16 +511,26 @@ export class ProjectEnvironmentService {
         { missing },
       );
     }
+    const environment = { ...input.credentials.environment, ...values, ...managed };
+    delete environment[originsName];
+    if (originsValue !== undefined) environment[originsName] = originsValue;
     return {
       ...input,
+      manifest: {
+        ...input.manifest,
+        environment: {
+          ...input.manifest.environment,
+          secrets: [...new Set([...input.manifest.environment.secrets, ...Object.keys(managed)])],
+        },
+      },
       credentials: {
         ...input.credentials,
-        environment: { ...input.credentials.environment, ...values },
+        environment,
       },
     };
   }
 
-  private async setupChecksum(input: Parameters<ProjectEnvironmentService["prepare"]>[0]) {
+  private async setupChecksum(input: EnvironmentInput) {
     const head = await this.runtime.exec(input.workspace, {
       command: "git",
       args: ["rev-parse", "HEAD"],
@@ -473,7 +582,7 @@ export class ProjectEnvironmentService {
     );
   }
 
-  private async waitUntilReady(input: Parameters<ProjectEnvironmentService["prepare"]>[0]) {
+  private async waitUntilReady(input: EnvironmentInput) {
     const ready = input.manifest.environment.ready;
     if (!ready) return;
     const deadline = Date.now() + (input.readinessTimeoutMs ?? 120_000);
@@ -496,19 +605,13 @@ export class ProjectEnvironmentService {
     });
   }
 
-  private async run(
-    input: Parameters<ProjectEnvironmentService["prepare"]>[0],
-    script: string,
-    cwd: string,
-    phase: string,
-  ) {
+  private async run(input: EnvironmentInput, script: string, cwd: string, phase: string) {
     const result = await this.command(input, script, cwd);
     const safeResult = redactResult(
       result,
       input.credentials.environment,
       input.manifest.environment.secrets,
     );
-    if (result.exitCode !== 0) throw commandFailure(phase, script, safeResult);
     await appendWorkspaceEvent(this.db, input.workspace.id, input.orgId, phase, {
       command: script,
       exitCode: result.exitCode,
@@ -516,14 +619,11 @@ export class ProjectEnvironmentService {
       stderr: tail(safeResult.stderr),
       durationMs: result.durationMs,
     });
+    if (result.exitCode !== 0) throw commandFailure(phase, script, safeResult);
     return result;
   }
 
-  private command(
-    input: Parameters<ProjectEnvironmentService["prepare"]>[0],
-    script: string,
-    cwd: string,
-  ) {
+  private command(input: EnvironmentInput, script: string, cwd: string) {
     return this.runtime.exec(input.workspace, {
       command: "sh",
       args: ["-lc", script],
@@ -534,7 +634,7 @@ export class ProjectEnvironmentService {
   }
 
   private async runCommand(
-    input: Parameters<ProjectEnvironmentService["prepare"]>[0],
+    input: EnvironmentInput,
     command: string,
     args: string[],
     cwd: string,
@@ -563,24 +663,6 @@ export function projectEnvironmentVariableName(projectId: string, name: string) 
     throw new ProjectEnvironmentError("project_id_invalid", "project id is invalid");
   }
   return `FACILITY_PROJECT_${projectId.toUpperCase()}_${EnvironmentName.parse(name)}`;
-}
-
-function isSafeGitBranch(branch: string) {
-  const hasControlOrForbiddenCharacter = [...branch].some((character) => {
-    const code = character.charCodeAt(0);
-    return code <= 0x20 || code === 0x7f || "~^:?*[\\".includes(character);
-  });
-  return Boolean(
-    branch &&
-      branch.length <= 200 &&
-      !branch.startsWith("-") &&
-      !branch.startsWith("/") &&
-      !branch.endsWith("/") &&
-      !branch.endsWith(".") &&
-      !branch.includes("..") &&
-      !branch.includes("@{") &&
-      !hasControlOrForbiddenCharacter,
-  );
 }
 
 function assertRepositoryContract(manifest: ProjectManifest, repositories: WorkspaceRepository[]) {
@@ -662,8 +744,8 @@ function redactCredentials(
   const secrets = new Set<string>();
   for (const [name, candidate] of Object.entries(environment)) {
     if (
-      (sensitiveNames.includes(name) || name.includes("TOKEN") || name.includes("CREDENTIAL")) &&
-      candidate.length >= 4
+      (sensitiveNames.includes(name) && candidate.length > 0) ||
+      ((name.includes("TOKEN") || name.includes("CREDENTIAL")) && candidate.length >= 4)
     ) {
       secrets.add(candidate);
     }

@@ -57,6 +57,11 @@ afterwards; later turns are blocked once the monthly limit is reached. The workt
 and engine sessions remain. Unknown model pricing is rejected while budget enforcement is enabled,
 and unavailable workspace pricing is not reported as zero.
 
+To use a newly supported model, update the agent's `model` field and ensure the
+deployed Facility version contains its price-book entry. See
+[cost and budget API behavior](reference/api.md) for the supported additions and
+fallback pricing limits. Catalog support does not grant provider access.
+
 ## How does Facility cover cost, observability, analytics, and delivery pipelines?
 
 Facility stores turn usage and cost, monthly project budgets, audit and observability records,
@@ -66,7 +71,7 @@ checks, and workflows. The API, worker, and PostgreSQL provide these functions.
 ## Is MCP the only interface?
 
 No. MCP is the primary automation interface. The web UI uses the same story, agent, environment,
-preview, lifecycle, budget, and pipeline services and can inspect and continue the shared
+preview, lifecycle, budget, and backlog services and can inspect and continue the shared
 conversation.
 
 ## How do I configure an existing repository?

@@ -6,22 +6,31 @@ import { newId } from "@facility/core";
 import {
   createDb,
   migrate,
+  orgMembers,
   orgs,
   projects,
+  roles,
   stories,
   storyArtifacts,
+  users,
   workspaceEvents,
   workspaces,
 } from "@facility/db";
 import { and, desc, eq } from "drizzle-orm";
 import postgres from "postgres";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { GithubWorkspaceCredentials } from "../src/github/workspace-credentials.js";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import type {
+  GithubWorkspaceCredentialBroker,
+  GithubWorkspaceCredentials,
+} from "../src/github/workspace-credentials.js";
+import type { AppConfig } from "../src/types.js";
 import { FakeWorkspaceRuntime } from "../src/workspaces/fake.js";
+import { WorkspacePreviewService } from "../src/workspaces/preview.js";
 import {
   ProjectEnvironmentService,
   parseProjectManifest,
 } from "../src/workspaces/project-environment.js";
+import type { WorkspaceRuntime } from "../src/workspaces/runtime.js";
 
 const databaseUrl =
   process.env.DATABASE_URL ?? "postgres://facility:facility@localhost:5461/facility_test";
@@ -81,6 +90,7 @@ environment:
 `);
 
   const credentials: GithubWorkspaceCredentials = {
+    gitIdentity: { name: "my-app[bot]", email: "12345+my-app[bot]@users.noreply.github.com" },
     repositories: [
       { owner: "acme", name: "app", defaultBranch: "main", role: "primary" },
       { owner: "acme", name: "shared", defaultBranch: "main", role: "related" },
@@ -138,6 +148,148 @@ environment:
     await rm(root, { recursive: true, force: true });
   });
 
+  it("injects runtime origins before setup but publishes them only after readiness", async () => {
+    const origin = "https://prepared-app.vercel.run";
+    const origins = { app: origin };
+    const fixture = runtime as FakeWorkspaceRuntime & Pick<WorkspaceRuntime, "previewOrigins">;
+    const lookup = vi.fn(async () => origins);
+    fixture.previewOrigins = lookup;
+    const expose = vi
+      .spyOn(runtime, "expose")
+      .mockResolvedValue([
+        { service: "app", port: 3000, protocol: "http", access: "native", url: origin },
+      ]);
+    const configured = {
+      ...manifest,
+      environment: {
+        ...manifest.environment,
+        variables: ["FACILITY_PREVIEW_ORIGINS"],
+        setup: 'printf "%s" "$FACILITY_PREVIEW_ORIGINS" > .setup-origins',
+        seed: undefined,
+      },
+    };
+    const spoof = JSON.stringify({ app: "https://untrusted.vercel.run" });
+    const environment = new ProjectEnvironmentService(
+      db,
+      fixture,
+      `file://${remotes}`,
+      () => spoof,
+      async () => ({ FACILITY_PREVIEW_ORIGINS: spoof }),
+    );
+    const input = {
+      orgId,
+      projectId,
+      workspace,
+      manifest: configured,
+      credentials: { ...credentials, environment: { FACILITY_PREVIEW_ORIGINS: spoof } },
+      branch: "facility/story-environment",
+      cleanSetup: true,
+      readinessTimeoutMs: 2_000,
+    };
+    try {
+      const [before] = await db.select().from(workspaces).where(eq(workspaces.id, workspaceId));
+      await expect(environment.prepare({ ...input, readinessTimeoutMs: 0 })).rejects.toThrow(
+        /readiness/i,
+      );
+      expect(
+        JSON.parse(
+          await readFile(join(workspace.volumeRef, "repos/acme/app/.setup-origins"), "utf8"),
+        ),
+      ).toEqual(origins);
+      expect(expose).not.toHaveBeenCalled();
+      const [unready] = await db.select().from(workspaces).where(eq(workspaces.id, workspaceId));
+      expect(unready?.endpoints).toEqual(before?.endpoints);
+      const prepared = await environment.prepare(input);
+      expect(prepared.processEnvironment.FACILITY_PREVIEW_ORIGINS).toBe(JSON.stringify(origins));
+      const [ready] = await db.select().from(workspaces).where(eq(workspaces.id, workspaceId));
+      expect(ready?.endpoints).toEqual(prepared.endpoints);
+      await environment.startPrepared({ ...input, setupChecksum: prepared.setupChecksum });
+      expect(lookup).toHaveBeenCalledTimes(3);
+      expect(lookup).toHaveBeenCalledWith(workspace, [
+        { service: "app", port: 3000, protocol: "http", websocket: true, url: "" },
+      ]);
+      expose.mockResolvedValue([
+        {
+          service: "app",
+          port: 3000,
+          protocol: "http",
+          access: "native",
+          url: "https://changed.vercel.run",
+        },
+      ]);
+      await expect(
+        environment.startPrepared({ ...input, setupChecksum: prepared.setupChecksum }),
+      ).rejects.toMatchObject({ code: "project_preview_origin_changed" });
+      const [unchanged] = await db.select().from(workspaces).where(eq(workspaces.id, workspaceId));
+      expect(unchanged?.endpoints).toEqual(ready?.endpoints);
+    } finally {
+      delete fixture.previewOrigins;
+      expose.mockRestore();
+    }
+  });
+
+  it("requires runtime support only for opted-in manifests and rejects operator fallbacks", async () => {
+    const fixture = runtime as FakeWorkspaceRuntime & Pick<WorkspaceRuntime, "previewOrigins">;
+    const lookup = vi.fn(async () => ({}));
+    fixture.previewOrigins = lookup;
+    const exec = vi.spyOn(runtime, "exec");
+    const spoof = JSON.stringify({ app: "https://untrusted.vercel.run" });
+    const environment = new ProjectEnvironmentService(
+      db,
+      fixture,
+      `file://${remotes}`,
+      () => spoof,
+      async () => ({ FACILITY_PREVIEW_ORIGINS: spoof }),
+    );
+    const input = {
+      orgId,
+      projectId,
+      workspace,
+      manifest,
+      credentials: { ...credentials, environment: { FACILITY_PREVIEW_ORIGINS: spoof } },
+      branch: "facility/story-environment",
+      readinessTimeoutMs: 2_000,
+    };
+    try {
+      await expect(
+        environment.prepare({
+          ...input,
+          manifest: {
+            ...manifest,
+            environment: { ...manifest.environment, variables: ["FACILITY_PREVIEW_ORIGINS"] },
+          },
+        }),
+      ).rejects.toMatchObject({ code: "project_environment_missing" });
+      expect(exec).not.toHaveBeenCalled();
+      lookup.mockClear();
+      // This call is rejected before hooks as well when the provider has no capability.
+      delete fixture.previewOrigins;
+      await expect(
+        environment.prepare({
+          ...input,
+          manifest: {
+            ...manifest,
+            environment: { ...manifest.environment, variables: ["FACILITY_PREVIEW_ORIGINS"] },
+          },
+        }),
+      ).rejects.toMatchObject({ code: "project_environment_missing" });
+      expect(exec).not.toHaveBeenCalled();
+      fixture.previewOrigins = lookup;
+      const legacy = await environment.prepare({
+        ...input,
+        manifest: {
+          ...manifest,
+          environment: { ...manifest.environment, setup: undefined, seed: undefined },
+        },
+      });
+      expect(lookup).not.toHaveBeenCalled();
+      expect(legacy.processEnvironment).not.toHaveProperty("FACILITY_PREVIEW_ORIGINS");
+    } finally {
+      delete fixture.previewOrigins;
+      exec.mockRestore();
+    }
+  });
+
   it("clones all repositories, creates the primary story branch, and runs setup once", async () => {
     const environment = new ProjectEnvironmentService(db, runtime, `file://${remotes}`);
     const locator = workspace;
@@ -169,6 +321,17 @@ environment:
       cwd: "repos/acme/app",
     });
     expect(branch.stdout.trim()).toBe("facility/story-environment");
+    for (const cwd of ["repos/acme/app", "repos/acme/shared"]) {
+      const author = await runtime.exec(locator, {
+        command: "git",
+        args: ["var", "GIT_AUTHOR_IDENT"],
+        cwd,
+      });
+      expect(author.exitCode).toBe(0);
+      expect(author.stdout).toMatch(
+        /^my-app\[bot\] <12345\+my-app\[bot\]@users\.noreply\.github\.com> /,
+      );
+    }
     expect(
       await readFile(join(workspace.volumeRef, "repos/acme/app/.facility-test/seed"), "utf8"),
     ).toBe("seeded");
@@ -189,6 +352,12 @@ environment:
       await db.select().from(storyArtifacts).where(eq(storyArtifacts.storyId, storyId)),
     ).toHaveLength(2);
 
+    // Repair existing workspaces created with the old unassociated address too.
+    await runtime.exec(locator, {
+      command: "git",
+      args: ["config", "user.email", "facility-agent@users.noreply.github.com"],
+      cwd: "repos/acme/app",
+    });
     await runtime.replaceCompute(locator);
     await environment.prepare({
       orgId,
@@ -200,12 +369,170 @@ environment:
       previousSetupChecksum: first.setupChecksum,
       readinessTimeoutMs: 2_000,
     });
+    const resumedAuthor = await runtime.exec(locator, {
+      command: "git",
+      args: ["var", "GIT_AUTHOR_IDENT"],
+      cwd: "repos/acme/app",
+    });
+    expect(resumedAuthor.stdout).toMatch(
+      /^my-app\[bot\] <12345\+my-app\[bot\]@users\.noreply\.github\.com> /,
+    );
     expect(await readFile(join(workspace.volumeRef, "repos/acme/app/.setup-count"), "utf8")).toBe(
       "1",
     );
     expect(
       await readFile(join(workspace.volumeRef, "repos/acme/shared/README.md"), "utf8"),
     ).toContain("shared");
+  });
+
+  it("opens previews on the agent's changed workspace without checkout, setup, or reseeding", async () => {
+    const environment = new ProjectEnvironmentService(db, runtime, `file://${remotes}`);
+    const prepared = await environment.prepare({
+      orgId,
+      projectId,
+      workspace,
+      manifest,
+      credentials,
+      branch: "facility/story-environment",
+      cleanSetup: true,
+    });
+    expect(prepared.setupChecksum).toMatch(/^[a-f0-9]{64}$/);
+    const repository = join(workspace.volumeRef, "repos/acme/app");
+    const git = async (args: string[]) => {
+      const result = await runtime.exec(workspace, { command: "git", args, cwd: "repos/acme/app" });
+      expect(result.exitCode, result.stderr).toBe(0);
+      return result.stdout.trim();
+    };
+    await git(["switch", "-c", "facility/agent-current-work"]);
+    await writeFile(join(repository, "README.md"), "Agent's committed implementation\n");
+    await git(["add", "README.md"]);
+    await git(["commit", "-m", "fix: implement the story"]);
+    const head = await git(["rev-parse", "HEAD"]);
+    await writeFile(join(repository, "uncommitted.txt"), "Work in progress\n");
+    await writeFile(join(repository, ".facility-test/seed"), "user-created-data");
+    await writeFile(join(workspace.volumeRef, ".facility/claude/session.json"), "claude-session");
+    await writeFile(join(workspace.volumeRef, ".facility/codex/session.json"), "codex-session");
+    const setupCount = await readFile(join(repository, ".setup-count"), "utf8");
+    const userId = newId("user");
+    const roleId = newId("role");
+    await db
+      .insert(users)
+      .values({ id: userId, email: `preview-reuse-${suffix}@example.com`, status: "active" });
+    await db.insert(roles).values({
+      id: roleId,
+      orgId,
+      name: `preview-reuse-${suffix}`,
+      permissions: ["workspaces:execute"],
+    });
+    await db.insert(orgMembers).values({ id: newId("member"), orgId, userId, roleId });
+    const previews = new WorkspacePreviewService(
+      db,
+      {
+        publicUrl: "https://api.example.com",
+        previewUrl: "https://preview.example.net",
+      } as AppConfig,
+      runtime,
+      {
+        issue: async () => credentials,
+      } as unknown as GithubWorkspaceCredentialBroker,
+      { load: async () => manifest },
+      environment,
+    );
+
+    for (const sleeping of [false, true]) {
+      if (sleeping) {
+        await runtime.replaceCompute(workspace);
+        await rm(join(repository, ".facility-test/status"));
+        await db
+          .update(workspaces)
+          .set({ state: "sleeping" })
+          .where(eq(workspaces.id, workspaceId));
+      }
+      const originalExec = runtime.exec.bind(runtime);
+      const exec = vi.spyOn(runtime, "exec").mockImplementation(async (locator, command) => {
+        const result = await originalExec(locator, command);
+        // A concurrent preparation may finish after preview open read its checksum.
+        await db
+          .update(workspaces)
+          .set({ setupChecksum: "concurrent-preparation-checksum" })
+          .where(eq(workspaces.id, workspaceId));
+        return result;
+      });
+      try {
+        const opened = await previews.open({ orgId, projectId, storyId, userId, service: "app" });
+        if (!opened.sessionId) throw new Error("Expected a legacy preview session");
+        expect(
+          exec.mock.calls.every(
+            ([locator]) => locator.id === workspaceId && locator.volumeRef === workspace.volumeRef,
+          ),
+        ).toBe(true);
+        const scripts = exec.mock.calls.map(([, command]) => {
+          expect(command.command).toBe("sh");
+          return command.args?.[1];
+        });
+        expect(scripts).toEqual(
+          sleeping
+            ? [manifest.environment.ready, manifest.environment.start, manifest.environment.ready]
+            : [manifest.environment.ready],
+        );
+        const token = new URL(opened.url).searchParams.get("token");
+        if (!token) throw new Error("expected one-time preview token");
+        await expect(previews.exchange(opened.sessionId, token)).resolves.toMatchObject({
+          workspaceId,
+        });
+        await expect(previews.exchange(opened.sessionId, token)).rejects.toMatchObject({
+          code: "preview_access_invalid",
+        });
+        await expect(previews.authorize(opened.sessionId, token)).resolves.toMatchObject({
+          workspaceId,
+        });
+      } finally {
+        exec.mockRestore();
+      }
+      expect(await git(["rev-parse", "HEAD"])).toBe(head);
+      expect(await git(["branch", "--show-current"])).toBe("facility/agent-current-work");
+      expect(await readFile(join(repository, "uncommitted.txt"), "utf8")).toBe(
+        "Work in progress\n",
+      );
+      expect(await readFile(join(repository, ".facility-test/seed"), "utf8")).toBe(
+        "user-created-data",
+      );
+      expect(await readFile(join(repository, ".setup-count"), "utf8")).toBe(setupCount);
+      expect(
+        await readFile(join(workspace.volumeRef, ".facility/claude/session.json"), "utf8"),
+      ).toBe("claude-session");
+      expect(
+        await readFile(join(workspace.volumeRef, ".facility/codex/session.json"), "utf8"),
+      ).toBe("codex-session");
+      const persisted = (
+        await db.select().from(workspaces).where(eq(workspaces.id, workspaceId))
+      )[0];
+      expect(persisted).toMatchObject({
+        state: "running",
+        setupChecksum: "concurrent-preparation-checksum",
+      });
+    }
+    await expect(
+      previews.open({ orgId: newId("org"), projectId, storyId, userId, service: "app" }),
+    ).rejects.toMatchObject({ code: "story_not_found" });
+  });
+
+  it("marks successful preparation without a setup script for future preview reuse", async () => {
+    const environment = new ProjectEnvironmentService(db, runtime, `file://${remotes}`);
+    const noSetup = {
+      ...manifest,
+      environment: { ...manifest.environment, setup: undefined, seed: undefined },
+    };
+    const prepared = await environment.prepare({
+      orgId,
+      projectId,
+      workspace,
+      manifest: noSetup,
+      credentials,
+      branch: "facility/story-environment",
+    });
+    const persisted = (await db.select().from(workspaces).where(eq(workspaces.id, workspaceId)))[0];
+    expect(persisted?.setupChecksum).toBe(prepared.setupChecksum);
   });
 
   it("validates declared environment before running setup and injects it ephemerally", async () => {
@@ -506,6 +833,41 @@ environment:
       const serialized = JSON.stringify(error);
       return !serialized.includes(secret) && serialized.includes("[REDACTED]");
     });
+    const [failure] = await db
+      .select()
+      .from(workspaceEvents)
+      .where(and(eq(workspaceEvents.orgId, orgId), eq(workspaceEvents.workspaceId, workspaceId)))
+      .orderBy(desc(workspaceEvents.seq))
+      .limit(1);
+    expect(failure?.type).toBe("environment.start");
+    expect(failure?.data).toMatchObject({ exitCode: 17, stderr: "[REDACTED]" });
+    expect(JSON.stringify(failure?.data)).not.toContain(secret);
+
+    await expect(
+      environment.prepare({
+        orgId,
+        projectId,
+        workspace,
+        credentials: protectedCredentials,
+        branch: "facility/story-environment",
+        manifest: {
+          ...failsWithSecret,
+          environment: {
+            ...failsWithSecret.environment,
+            setup: "printf 'setup mismatch %s' \"$GH_TOKEN\" >&2; exit 19",
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "environment_command_failed" });
+    const [setupFailure] = await db
+      .select()
+      .from(workspaceEvents)
+      .where(and(eq(workspaceEvents.orgId, orgId), eq(workspaceEvents.workspaceId, workspaceId)))
+      .orderBy(desc(workspaceEvents.seq))
+      .limit(1);
+    expect(setupFailure?.type).toBe("environment.setup");
+    expect(setupFailure?.data).toMatchObject({ exitCode: 19, stderr: "setup mismatch [REDACTED]" });
+    expect(JSON.stringify(setupFailure?.data)).not.toContain(secret);
   });
 });
 

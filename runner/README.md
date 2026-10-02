@@ -49,7 +49,9 @@ without becoming an administrator of every Facility workspace on the host.
 - `runner` is the default Docker workspace image and runs normal commands as
   the `node` user.
 - `vercel-runner` leaves Vercel's trusted initialization path as root; Facility
-  runs agent commands as `node` after initialization.
+  runs agent commands as `node` after initialization. This target includes
+  `sudo` for the Vercel SDK's user switch. Its build verifies that root can
+  switch to `node` and that `node` cannot use sudo to become root.
 
 The default command sleeps because lifecycle and agent commands arrive through
 the workspace provider. The image is not the Facility API or worker image.
@@ -99,3 +101,17 @@ binary version alone.
 Do not put engine tokens, GitHub credentials, project secrets, or provider
 configuration into the image. Facility injects short-lived and project-scoped
 values when preparing a story.
+
+### Claude Code model compatibility
+
+The runner pins Claude Code 2.1.284, which includes explicit support for
+`claude-opus-5-5` and `claude-sonnet-5-5`. Model selection still belongs to each
+agent manifest; updating this CLI does not switch a project's models or credentials.
+See the [upstream changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md).
+
+Publishing a new runner image does not upgrade a persistent sandbox's existing
+filesystem on resume. Check `claude --version` in the actual workspace. Existing
+workspaces need a separately managed tool upgrade or the provider's supported
+compute replacement procedure with persistent data retained; do not delete a
+workspace merely to pick up a CLI update. Test fresh and resumed agent sessions
+after an upgrade, and keep a rollback path to the previous toolchain.

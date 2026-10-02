@@ -8,6 +8,25 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const docsRoot = resolve(repoRoot, "apps/docs/docs");
 const read = (path) => readFileSync(resolve(repoRoot, path), "utf8");
 
+test("repository unlink documents cleanup, retention, permissions and primary replacement", () => {
+  const reference = read("apps/docs/docs/reference/api.md");
+  for (const contract of [
+    "repos:write",
+    "repository_in_use",
+    "repository_disconnected",
+    "Idempotency-Key",
+    "oldest remaining",
+    "webhook",
+    "never removes conversations",
+  ]) {
+    assert.ok(reference.toLowerCase().includes(contract.toLowerCase()), contract);
+  }
+  const guide = read("apps/docs/docs/guides/existing-repo.md");
+  assert.match(guide, /confirm disconnect/);
+  assert.match(guide, /not the[\s\S]*GitHub repository itself/);
+  assert.match(guide, /Archiving does not remove/);
+});
+
 test("the published navigation covers user, operator, reference, and contributor paths", () => {
   const sidebar = read("apps/docs/sidebars.ts");
   const requiredPages = [
@@ -41,15 +60,27 @@ test("the published navigation covers user, operator, reference, and contributor
 
 test("the product identity describes a reviewable AI SDLC", () => {
   const readme = read("README.md");
-  assert.match(
-    readme,
-    /Facility is open-source, self-hosted tooling for running AI coding agents as[\s\S]*part of a reviewable software delivery process[\s\S]*humans, the gates[\s\S]*evidence in one place/,
-  );
-  assert.match(readme, /Status: early software, published early on purpose/);
-  assert.match(readme, /Who Facility is for/);
-  assert.match(readme, /What you can do with it/);
-  assert.match(readme, /Take work from an issue to a pull request/);
-  assert.match(readme, /Review what an agent changed/);
+  // Protect the public concepts and setup paths without fixing the landing copy
+  // or section titles to a particular editorial version.
+  for (const concept of [
+    /open-source, self-hosted/,
+    /Claude Code and Codex/,
+    /persistent workspace/i,
+    /early software/,
+    /reviews, and branch protection/,
+    /explicit workspace deletion/,
+  ]) {
+    assert.match(readme, concept);
+  }
+  for (const target of [
+    "#quick-start-run-facility",
+    "apps/docs/docs/self-host/quickstart.md",
+    "apps/docs/docs/reference/security.md",
+    "apps/docs/docs/reference/project-manifest.md",
+    "apps/docs/docs/reference/agent-manifest.md",
+  ]) {
+    assert.ok(readme.includes(`](${target})`), `README must link to ${target}`);
+  }
 
   const index = read("apps/docs/docs/index.md");
   assert.match(index, /Facility is an AI SDLC system/);
@@ -74,6 +105,9 @@ test("the project manifest reference covers every strict field", () => {
     "related",
     "environment",
     "image",
+    "resources",
+    "cpu",
+    "memory_mb",
     "setup",
     "start",
     "ready",
@@ -234,7 +268,7 @@ test("the API reference maps every resource family", () => {
     "/costs",
     "/budget",
     "/observability",
-    "/pipeline",
+    "/backlog",
     "/github/sync",
     "/audit",
   ]) {
